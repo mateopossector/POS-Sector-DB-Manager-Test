@@ -221,6 +221,54 @@ class SqlServer:
             cur.execute("SELECT 1 FROM sys.server_principals WHERE name = ?", name)
             return cur.fetchone() is not None
 
+    def list_sql_logins(self):
+        """Vrati [(name, is_disabled, 'role1, role2'), ...] za SQL (ne-Windows) loginove."""
+        sql = (
+            "SELECT sp.name, sp.is_disabled, "
+            "STUFF(("
+            "   SELECT ', ' + sp2.name "
+            "   FROM sys.server_role_members rm "
+            "   JOIN sys.server_principals sp2 ON sp2.principal_id = rm.role_principal_id "
+            "   WHERE rm.member_principal_id = sp.principal_id "
+            "   FOR XML PATH('')"
+            "), 1, 2, '') AS roles "
+            "FROM sys.server_principals sp "
+            "WHERE sp.type = 'S' AND sp.name NOT LIKE '##%' "
+            "ORDER BY sp.name"
+        )
+        with self.connect() as c:
+            cur = c.cursor()
+            cur.execute(sql)
+            return [(r[0], bool(r[1]), r[2] or "") for r in cur.fetchall()]
+
+    def change_password(self, name, password, enforce_policy, log):
+        policy = "ON" if enforce_policy else "OFF"
+        with self.connect() as c:
+            cur = c.cursor()
+            cur.execute(
+                f"ALTER LOGIN {self._q(name)} WITH PASSWORD = {self._lit(password)}")
+            cur.execute(
+                f"ALTER LOGIN {self._q(name)} WITH "
+                f"CHECK_POLICY = {policy}"
+                + ("" if enforce_policy else ", CHECK_EXPIRATION = OFF"))
+        log(f"Lozinka za '{name}' promijenjena.")
+
+    def delete_login(self, name, log):
+        with self.connect() as c:
+            cur = c.cursor()
+            # izbaci aktivne sesije ovog logina prije brisanja
+            cur.execute(
+                "SELECT session_id FROM sys.dm_exec_sessions WHERE login_name = ?", name)
+            sessions = [r[0] for r in cur.fetchall()]
+            for sid in sessions:
+                try:
+                    cur.execute(f"KILL {sid}")
+                    log(f"   sesija {sid} prekinuta.")
+                except pyodbc.Error as e:
+                    log(f"   (upozorenje pri KILL {sid}: {e})")
+            cur.execute(f"DROP LOGIN {self._q(name)}")
+        log(f"Login '{name}' obrisan.")
+
     def create_or_update_login(self, name, password, enforce_policy, roles, log):
         exists = self.login_exists(name)
         policy = "ON" if enforce_policy else "OFF"
@@ -294,8 +342,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("POS Sector DB Manager")
-        self.geometry("760x640")
-        self.minsize(680, 560)
+        self.geometry("760x860")
+        self.minsize(680, 700)
         self.configure(bg=self.BG)
         self.db = SqlServer()
         self._busy = False
@@ -474,6 +522,45 @@ class App(tk.Tk):
         ttk.Button(uf, text="Kreiraj / azuriraj korisnika", style="Accent.TButton",
                    command=self.on_create_login).grid(row=5, column=1, sticky="w", pady=(4, 0))
 
+        ttk.Separator(uf, orient="horizontal").grid(
+            row=6, column=0, columnspan=3, sticky="ew", pady=(12, 8))
+        ttk.Label(uf, text="Postojeci SQL loginovi", style="Panel.TLabel",
+                  foreground=self.BLUE, font=("Segoe UI", 11, "bold")).grid(
+            row=7, column=0, columnspan=3, sticky="w")
+        ttk.Label(uf, text="(klikni na korisnika da ga ucitas u formu iznad)",
+                  style="Panel.TLabel", foreground=self.MUTED).grid(
+            row=8, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        tree_frame = ttk.Frame(uf, style="Panel.TFrame")
+        tree_frame.grid(row=9, column=0, columnspan=3, sticky="nsew", pady=(2, 4))
+        uf.rowconfigure(9, weight=1)
+
+        columns = ("name", "status", "roles")
+        self.users_tree = ttk.Treeview(
+            tree_frame, columns=columns, show="headings", height=6, selectmode="browse")
+        self.users_tree.heading("name", text="Korisnik")
+        self.users_tree.heading("status", text="Status")
+        self.users_tree.heading("roles", text="Role")
+        self.users_tree.column("name", width=150, anchor="w")
+        self.users_tree.column("status", width=90, anchor="center")
+        self.users_tree.column("roles", width=260, anchor="w")
+        self.users_tree.pack(side="left", fill="both", expand=True)
+        self.users_tree.bind("<<TreeviewSelect>>", self._on_user_select)
+
+        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical",
+                                    command=self.users_tree.yview)
+        self.users_tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side="right", fill="y")
+
+        users_btns = ttk.Frame(uf, style="Panel.TFrame")
+        users_btns.grid(row=10, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        ttk.Button(users_btns, text="Osvjezi listu",
+                   command=self.on_refresh_logins).pack(side="left", padx=(0, 6))
+        ttk.Button(users_btns, text="Promijeni samo lozinku",
+                   command=self.on_change_password).pack(side="left", padx=6)
+        ttk.Button(users_btns, text="Obrisi korisnika",
+                   command=self.on_delete_login).pack(side="left", padx=6)
+
         # SERVER
         sf = ttk.Frame(nb, style="Panel.TFrame", padding=14)
         nb.add(sf, text="  Server  ")
@@ -572,6 +659,7 @@ class App(tk.Tk):
                 self.backup_db.current(0)
             self.status_lbl.configure(text="Spojeno", foreground="#2e7d32")
             self.log(f"Baze: {', '.join(dbs) if dbs else '(nema korisnickih)'}")
+            self._refresh_logins_sync()
         self._run_async(job)
 
     def on_backup(self):
@@ -618,6 +706,71 @@ class App(tk.Tk):
             self.log(f"Kreiram/azuriram korisnika '{name}' (role: {', '.join(roles) or 'nema'})")
             self.db.create_or_update_login(
                 name, pwd, self.enforce_policy.get(), roles, self.log)
+            self._refresh_logins_sync()
+        self._run_async(job)
+
+    def _on_user_select(self, event=None):
+        sel = self.users_tree.selection()
+        if not sel:
+            return
+        name, _status, roles_str = self.users_tree.item(sel[0], "values")
+        self.new_user.set(name)
+        self.new_pass.set("")
+        selected_roles = {r.strip() for r in roles_str.split(",") if r.strip()}
+        for role, v in self.role_vars.items():
+            v.set(role in selected_roles)
+
+    def _refresh_logins_sync(self):
+        # NAPOMENA: zove se iz worker thread-a (unutar _run_async), bez ugnijezdenog _run_async
+        logins = self.db.list_sql_logins()
+        self.users_tree.delete(*self.users_tree.get_children())
+        for name, disabled, roles in logins:
+            status = "Onemoguceno" if disabled else "Omoguceno"
+            self.users_tree.insert("", "end", values=(name, status, roles))
+        self.log(f"Ucitano {len(logins)} SQL login(a).")
+
+    def on_refresh_logins(self):
+        self._sync_db_settings()
+        self._run_async(self._refresh_logins_sync)
+
+    def on_change_password(self):
+        self._sync_db_settings()
+        sel = self.users_tree.selection()
+        name = self.users_tree.item(sel[0], "values")[0] if sel else self.new_user.get().strip()
+        pwd = self.new_pass.get()
+        if not name:
+            messagebox.showwarning("Fali podatak", "Izaberi korisnika u listi ili upisi korisnicko ime.")
+            return
+        if not pwd:
+            messagebox.showwarning("Fali podatak", "Upisi novu lozinku.")
+            return
+        if not messagebox.askyesno("Potvrda", f"Promijeniti lozinku za '{name}'?"):
+            return
+
+        def job():
+            self.log(f"Mijenjam lozinku za '{name}' ...")
+            self.db.change_password(name, pwd, self.enforce_policy.get(), self.log)
+            self._refresh_logins_sync()
+        self._run_async(job)
+
+    def on_delete_login(self):
+        self._sync_db_settings()
+        sel = self.users_tree.selection()
+        if not sel:
+            messagebox.showwarning("Fali podatak", "Izaberi korisnika u listi.")
+            return
+        name = self.users_tree.item(sel[0], "values")[0]
+        if not messagebox.askyesno(
+                "Potvrda brisanja",
+                f"Obrisati login '{name}'?\n\n"
+                f"Aktivne konekcije tog korisnika ce biti prekinute. "
+                f"Ova akcija se ne moze vratiti."):
+            return
+
+        def job():
+            self.log(f"Brisem login '{name}' ...")
+            self.db.delete_login(name, self.log)
+            self._refresh_logins_sync()
         self._run_async(job)
 
     def on_enable_mixed(self):
